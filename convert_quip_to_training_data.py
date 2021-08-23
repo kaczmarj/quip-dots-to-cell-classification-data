@@ -45,10 +45,10 @@ from shapely.geometry import Polygon
 
 # Custom types.
 PathType = ty.Union[str, Path]
-BBox = namedtuple("bbox", "x0 y0 x1 y1 path")
+TileBoundingBox = namedtuple("bbox", "x0 y0 x1 y1 path")
 
 
-def _get_bboxes_from_filenames(paths: ty.Sequence[Path]) -> ty.List[BBox]:
+def _get_bboxes_from_filenames(paths: ty.Sequence[Path]) -> ty.List[TileBoundingBox]:
     """Convert filenames to bounding box objects."""
     bboxes = []
     for p in paths:
@@ -56,11 +56,11 @@ def _get_bboxes_from_filenames(paths: ty.Sequence[Path]) -> ty.List[BBox]:
         x0, y0 = int(psplit[0]), int(psplit[1])
         x1 = x0 + int(psplit[2])
         y1 = y0 + int(psplit[3])
-        bboxes.append(BBox(x0, y0, x1, y1, p))
+        bboxes.append(TileBoundingBox(x0, y0, x1, y1, p))
     return bboxes
 
 
-def _point_in_bbox(bbox: BBox, point: ty.Tuple[float, float]) -> bool:
+def _point_in_bbox(bbox: TileBoundingBox, point: ty.Tuple[float, float]) -> bool:
     """Return whether an XY point is inside a bounding box."""
     in_x = bbox.x0 <= point[0] <= bbox.x1
     in_y = bbox.y0 <= point[1] <= bbox.y1
