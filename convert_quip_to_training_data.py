@@ -12,6 +12,7 @@ python convert_quip_to_training_data.py \\
     --dump-path /data/quip_distro/data/dump/TCGA:paad-2021-7-30-17-47-57/ \\
     --svs-root /data/quip_distro/images/tcga_data/paad/ \\
     --polygon-root /data/quip_distro/data/kaczmarj/hou-scientific-data-nuclei-v0/paad_polygon/ \\
+    --roi-name "Waqas 500p Non-Tumor 500p" \\
     --label-regex Waqas \\
     --subject-ids TCGA-2J-AAB9 TCGA-2J-AABA \\
     --save-polygon-overlays \\
@@ -40,8 +41,11 @@ import openslide
 import pandas as pd
 from PIL import ImageDraw
 from shapely import affinity
+from shapely.geometry import MultiPolygon
 from shapely.geometry import Point
 from shapely.geometry import Polygon
+from shapely.geometry import box as _box
+from shapely.ops import unary_union as _unary_union
 
 # Custom types.
 PathType = ty.Union[str, Path]
@@ -60,11 +64,39 @@ def _get_bboxes_from_filenames(paths: ty.Sequence[Path]) -> ty.List[TileBounding
     return bboxes
 
 
-def _point_in_bbox(bbox: TileBoundingBox, point: ty.Tuple[float, float]) -> bool:
-    """Return whether an XY point is inside a bounding box."""
+def _point_in_tilebbox(bbox: TileBoundingBox, point: ty.Tuple[float, float]) -> bool:
+    """Return whether an XY point is inside a tile bounding box."""
     in_x = bbox.x0 <= point[0] <= bbox.x1
     in_y = bbox.y0 <= point[1] <= bbox.y1
     return in_x and in_y
+
+
+def _get_human_rois_as_multi_polygon(
+    json_data: ty.List[ty.Dict[str, ty.Any]],
+    roi_name: str,
+    slide_width: int,
+    slide_height: int,
+    bbox_size: int = 500,
+) -> MultiPolygon:
+    """Return a shapely MultiPolygon representing all of the human ROIs.
+
+    The human ROIs are the boxes that are placed on a slide and in which nuclei are
+    dotted.
+    """
+
+    def get_polygon_from_label(label):
+        coords = label["geometries"]["features"][0]["bound"]["coordinates"][0]
+        coords = [(int(x * slide_width), int(y * slide_height)) for x, y in coords]
+        minx = min(coords, key=lambda x: x[0])[0]
+        miny = min(coords, key=lambda x: x[1])[1]
+        maxx = max(coords, key=lambda x: x[0])[0] + bbox_size
+        maxy = max(coords, key=lambda x: x[1])[1] + bbox_size
+        return _box(minx=minx, miny=miny, maxx=maxx, maxy=maxy)
+
+    rois = [d for d in json_data if d["properties"]["annotations"]["notes"] == roi_name]
+    bboxes = [get_polygon_from_label(roi) for roi in rois]
+    bboxes_union = _unary_union(bboxes)
+    return bboxes_union
 
 
 def _chunks(lst: ty.Sequence, n: int) -> ty.Generator[ty.Sequence, None, None]:
@@ -108,6 +140,7 @@ def _make_tile_filename(
 # Workflow...
 # For each JSON file in the dump, get each label (i.e., point).
 # For each JSON file, get the path to the corresponding whole slide image.
+# If there are human-made ROIs, check for each point if the point is inside the ROIs.
 # For each label in the JSON file, find the file in Le Hou's data that contains the
 # point. Then look through that file and find the polygon that contains the point.
 # Check that there is only one.
@@ -122,6 +155,7 @@ def save_tiles(
     svs_root: PathType,
     polygon_root: PathType,
     dump_path: PathType,
+    roi_name: str = None,
     label_regex: str = None,
     subject_ids: ty.Iterable[str] = None,
     save_polygon_overlays: bool = False,
@@ -140,6 +174,10 @@ def save_tiles(
         Path to the polygons (e.g., *-features.csv) from Hou et al. (Scientific Data).
     dump_path : str or Path
         Path to the data dump on QuIP.
+    roi_name : str, optional
+        The name of the label that defines the region of interest, inside which nuclei
+        are annotated. If provided, only dots contained inside the polygons named
+        <roi_name> are included.
     label_regex : str, optional
         Regular expression for the label names. If provided, will only save labels that
         match the expression.
@@ -173,6 +211,21 @@ def save_tiles(
         with open(dump_path / json_file) as f:
             json_data = json.load(f)
         print(f"Found {len(json_data):,} labels")
+
+        oslide = openslide.OpenSlide(str(svs_root / original_svs_path.name))
+
+        # If the name of the human ROI label is given, we create a polygon representing
+        # the union of all of those regions. We keep dots that are inside those regions.
+        human_rois: ty.Optional[MultiPolygon] = None
+        if roi_name is not None:
+            human_rois = _get_human_rois_as_multi_polygon(
+                json_data=json_data,
+                roi_name=roi_name,
+                slide_width=oslide.dimensions[0],
+                slide_height=oslide.dimensions[1],
+                bbox_size=500,  # TODO: we shouldn't hardcode this but for now it's ok.
+            )
+
         # Keep only "point" types.
         json_data = [
             d
@@ -186,8 +239,7 @@ def save_tiles(
             print("WARNING: will take the first point for those cases")
 
         print("Number of points per class:")
-        # Use [:-10] to remove the _adlfkjld suffixes
-        _tmp = Counter(d["properties"]["annotations"]["name"][:-10] for d in json_data)
+        _tmp = Counter(d["properties"]["annotations"]["notes"] for d in json_data)
         for k, v in _tmp.items():
             print(f"    {k}: {v}")
         del _tmp
@@ -204,14 +256,13 @@ def save_tiles(
             continue
         print(f"Found {len(polygon_paths):,} CSV files with polygons")
 
-        oslide = openslide.OpenSlide(str(svs_root / original_svs_path.name))
         bboxes = _get_bboxes_from_filenames(polygon_paths)
 
         for human_label in json_data:
-            class_label: str = human_label["properties"]["annotations"]["name"][:-10]
-
+            class_label: str = human_label["properties"]["annotations"]["notes"]
             if label_regex is not None:
                 if label_regex.match(class_label) is None:
+                    print("SKIPPING label because does not match label regex")
                     continue
 
             point: ty.Tuple[float, float] = human_label["geometries"]["features"][0][
@@ -224,7 +275,14 @@ def save_tiles(
             point[0] *= oslide.dimensions[0]
             point[1] *= oslide.dimensions[1]
 
-            bboxes_containing_point = [b for b in bboxes if _point_in_bbox(b, point)]
+            if human_rois is not None:
+                if not human_rois.contains(Point(*point)):
+                    print("SKIPPING label because outside of human ROIs")
+                    continue
+
+            bboxes_containing_point = [
+                b for b in bboxes if _point_in_tilebbox(b, point)
+            ]
             if not bboxes_containing_point:
                 print("SKIPPING label because could not find corresponding feature CSV")
                 continue
@@ -315,6 +373,11 @@ def _get_parsed_args(args=None) -> argparse.Namespace:
         help="Only keep regular expressions that match this label.",
     )
     p.add_argument(
+        "--roi-name",
+        default=None,
+        help="Name of human bounding box label. Assumed to be 500px in size.",
+    )
+    p.add_argument(
         "--subject-ids",
         nargs="+",
         help="Only use images from these subject IDs. By default, use all images.",
@@ -335,6 +398,7 @@ if __name__ == "__main__":
         svs_root=args.svs_root,
         polygon_root=args.polygon_root,
         dump_path=args.dump_path,
+        roi_name=args.roi_name,
         label_regex=args.label_regex,
         subject_ids=args.subject_ids,
         save_polygon_overlays=args.save_polygon_overlays,
