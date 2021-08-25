@@ -225,6 +225,8 @@ def save_tiles(
                 slide_height=oslide.dimensions[1],
                 bbox_size=500,  # TODO: we shouldn't hardcode this but for now it's ok.
             )
+            if not human_rois:
+                raise ValueError(f"found no ROIs with label '{roi_name}'")
 
         # Keep only "point" types.
         json_data = [
